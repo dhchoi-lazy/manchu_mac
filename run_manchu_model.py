@@ -32,12 +32,13 @@ if torch.backends.mps.is_available():
 
 
 if torch.cuda.is_available():
-
+    # Force synchronous CUDA operations for better error tracking
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     os.environ["TORCH_USE_CUDA_DSA"] = "1"
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    # Disable TF32 for more stable computations
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
@@ -64,29 +65,46 @@ def optimize_memory():
 
 
 def validate_tensor_inputs(inputs, processor):
-    """Validate tensor inputs to prevent CUDA scatter/gather errors"""
+    """Enhanced tensor validation to prevent CUDA errors"""
     try:
-
+        # Validate input_ids
         if "input_ids" in inputs:
             input_ids = inputs["input_ids"]
             vocab_size = processor.tokenizer.vocab_size
 
+            # Check for out-of-bounds tokens
             if torch.any(input_ids >= vocab_size) or torch.any(input_ids < 0):
                 print(
                     f"⚠️  Warning: Found out-of-bounds token IDs. Vocab size: {vocab_size}"
                 )
-
+                # Fix by clamping to valid range
                 inputs["input_ids"] = torch.clamp(input_ids, 0, vocab_size - 1)
 
+            # Check for empty sequences
+            if input_ids.numel() == 0:
+                print("⚠️  Warning: Empty input_ids detected")
+                return False
+
+        # Validate attention mask
         if "attention_mask" in inputs:
             attention_mask = inputs["attention_mask"]
-
+            # Ensure binary mask
             if not torch.all((attention_mask == 0) | (attention_mask == 1)):
                 print("⚠️  Warning: Non-binary attention mask detected, fixing...")
                 inputs["attention_mask"] = (attention_mask > 0).long()
 
+            # Check dimensions match input_ids
+            if (
+                "input_ids" in inputs
+                and attention_mask.shape != inputs["input_ids"].shape
+            ):
+                print("⚠️  Warning: Attention mask shape mismatch")
+                return False
+
+        # Validate pixel values
         if "pixel_values" in inputs:
             pixel_values = inputs["pixel_values"]
+            # Check for NaN or Inf values
             if torch.any(torch.isnan(pixel_values)) or torch.any(
                 torch.isinf(pixel_values)
             ):
@@ -96,6 +114,13 @@ def validate_tensor_inputs(inputs, processor):
                 inputs["pixel_values"] = torch.nan_to_num(
                     pixel_values, nan=0.0, posinf=1.0, neginf=0.0
                 )
+
+            # Ensure correct dtype
+            if (
+                pixel_values.dtype != torch.float16
+                and pixel_values.dtype != torch.float32
+            ):
+                inputs["pixel_values"] = pixel_values.float()
 
         return True
 
@@ -253,52 +278,47 @@ def save_batch_results(results, output_dir="batch_ocr_results"):
 
 
 def setup_model(model_name="dhchoi/manchu-llama32-11b-vision-merged"):
+    """Enhanced model setup with better CUDA handling"""
     device = check_device()
 
     print("🚀 Optimizing model setup for better performance...")
 
+    # Setup cache directory
     cache_dir = os.path.join(os.getcwd(), ".hf_cache")
     os.makedirs(cache_dir, exist_ok=True)
-    print(f"📁 Using cache directory: {cache_dir}")
 
+    # Load processor
     processor = AutoProcessor.from_pretrained(
         model_name, trust_remote_code=True, cache_dir=cache_dir
     )
 
+    # Set padding side for batch processing
     processor.tokenizer.padding_side = "left"
 
-    if device == "mps":
-        print("⚡ Loading model with MPS optimizations...")
-        model = MllamaForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-            max_memory={0: "16GiB", "cpu": "20GiB"},
-            attn_implementation="flash_attention_2",
-            cache_dir=cache_dir,
-        )
-        model.eval()
-
-        print("ℹ️  Skipping torch.compile on MPS device")
-
-    elif device == "cuda":
+    if device == "cuda":
         print("⚡ Loading model with CUDA optimizations...")
         try:
+            # Load with careful memory management
             model = MllamaForConditionalGeneration.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
-                attn_implementation="flash_attention_2",
+                # Use standard attention instead of flash attention to avoid kernel errors
+                attn_implementation="eager",  # Changed from "flash_attention_2"
                 use_safetensors=True,
                 cache_dir=cache_dir,
             )
+
+            # Move model to CUDA with error handling
+            if hasattr(model, "cuda"):
+                model = model.cuda()
+
             model.eval()
 
-            print("ℹ️  Skipping torch.compile on CUDA to avoid kernel errors")
+            # Clear any initial memory
+            torch.cuda.empty_cache()
 
         except Exception as e:
             print(f"⚠️  CUDA model loading failed: {e}")
@@ -313,8 +333,20 @@ def setup_model(model_name="dhchoi/manchu-llama32-11b-vision-merged"):
             )
             model.eval()
 
-    else:
-        print("⚡ Loading model with CPU optimizations...")
+    elif device == "mps":
+        print("⚡ Loading model with MPS optimizations...")
+        model = MllamaForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            cache_dir=cache_dir,
+        )
+        model.eval()
+
+    else:  # CPU
+        print("⚡ Loading model for CPU...")
         model = MllamaForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.float32,
@@ -399,16 +431,20 @@ def generate_text_streaming(
 
 
 def generate_with_image(model, processor, prompt, image_path, max_length=64):
+    """Enhanced generation with better CUDA error handling"""
     try:
-        if os.path.exists(image_path):
-            image = Image.open(image_path).convert("RGB")
-
-            max_size = 1024
-            if image.size[0] > max_size or image.size[1] > max_size:
-                image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        else:
+        if not os.path.exists(image_path):
             return None
 
+        # Load and preprocess image
+        image = Image.open(image_path).convert("RGB")
+
+        # Resize if too large
+        max_size = 1024
+        if image.size[0] > max_size or image.size[1] > max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+        # Prepare messages
         messages = [
             {
                 "role": "user",
@@ -418,6 +454,7 @@ def generate_with_image(model, processor, prompt, image_path, max_length=64):
 
         input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
 
+        # Process inputs with error handling
         try:
             inputs = processor(
                 text=input_text,
@@ -431,64 +468,96 @@ def generate_with_image(model, processor, prompt, image_path, max_length=64):
             print(f"⚠️  Processor failed: {e}")
             return None
 
+        # Validate inputs
         if not validate_tensor_inputs(inputs, processor):
             print("⚠️  Tensor validation failed, skipping this image")
             return None
 
-        first_param_device = next(model.parameters()).device
+        # Get device
+        device = next(model.parameters()).device
 
+        # Move to device with error handling
         try:
-            inputs = {k: v.to(first_param_device) for k, v in inputs.items()}
+            # Move tensors one by one for better error tracking
+            for key in inputs:
+                inputs[key] = inputs[key].to(device)
         except Exception as e:
             print(f"⚠️  Failed to move tensors to device: {e}")
-            return None
+            # Try CPU fallback
+            inputs = {k: v.cpu() for k, v in inputs.items()}
+            device = torch.device("cpu")
 
+        # Generate with multiple fallback strategies
         try:
             with torch.no_grad():
+                # First attempt with cache
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_length,
+                    use_cache=True,
+                    temperature=0.1,
+                    do_sample=True,
+                    top_p=0.95,
+                    repetition_penalty=1.05,
+                    pad_token_id=processor.tokenizer.eos_token_id,
+                    num_beams=1,
+                    # Disable some features that can cause CUDA errors
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict_in_generate=False,
+                )
 
-                with torch.inference_mode():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=max_length,
-                        use_cache=True,
-                        temperature=0.1,
-                        do_sample=True,
-                        top_p=0.95,
-                        repetition_penalty=1.05,
-                        pad_token_id=processor.tokenizer.eos_token_id,
-                        num_beams=1,
-                        output_attentions=False,
-                        output_hidden_states=False,
-                    )
         except RuntimeError as e:
-            if "CUDA" in str(e) or "scatter" in str(e) or "gather" in str(e):
-                print(f"⚠️  CUDA kernel error detected: {e}")
-                print("🔄 Attempting recovery with CPU fallback...")
+            if "CUDA" in str(e) or "out of memory" in str(e):
+                print(f"⚠️  CUDA error detected: {e}")
+                print("🔄 Attempting simplified generation...")
+
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
                 try:
-                    model_device = next(model.parameters()).device
-                    inputs_cpu = {k: v.cpu() for k, v in inputs.items()}
-
+                    # Simplified generation without sampling
                     with torch.no_grad():
                         outputs = model.generate(
-                            **inputs_cpu,
+                            **inputs,
                             max_new_tokens=max_length,
-                            use_cache=False,
-                            temperature=0.1,
-                            do_sample=False,
+                            use_cache=False,  # Disable cache
+                            do_sample=False,  # Disable sampling
+                            temperature=1.0,
                             pad_token_id=processor.tokenizer.eos_token_id,
                             num_beams=1,
                             output_attentions=False,
                             output_hidden_states=False,
                         )
-                    print("✅ CPU fallback successful")
-                except Exception as cpu_e:
-                    print(f"❌ CPU fallback also failed: {cpu_e}")
-                    return None
+                except Exception as e2:
+                    print(f"❌ Simplified generation also failed: {e2}")
+                    # Final CPU fallback
+                    try:
+                        print("🔄 Final CPU fallback attempt...")
+                        inputs_cpu = {k: v.cpu() for k, v in inputs.items()}
+                        model_cpu = model.cpu()
+
+                        with torch.no_grad():
+                            outputs = model_cpu.generate(
+                                **inputs_cpu,
+                                max_new_tokens=max_length,
+                                do_sample=False,
+                                pad_token_id=processor.tokenizer.eos_token_id,
+                            )
+
+                        # Move model back to original device
+                        model.to(device)
+
+                    except Exception as e3:
+                        print(f"❌ All generation attempts failed: {e3}")
+                        return None
             else:
                 print(f"⚠️  Generation failed: {e}")
                 return None
 
+        # Decode output
         try:
             generated_text = processor.tokenizer.decode(
                 outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
@@ -497,18 +566,15 @@ def generate_with_image(model, processor, prompt, image_path, max_length=64):
             print(f"⚠️  Decoding failed: {e}")
             return None
 
+        # Cleanup
         del inputs, outputs, image
 
-        if device := next(model.parameters()).device.type:
-            if (
-                device == "cuda"
-                and torch.cuda.memory_allocated()
-                > torch.cuda.get_device_properties(0).total_memory * 0.8
-            ):
-                torch.cuda.empty_cache()
-            elif device == "mps":
-
-                pass
+        # Memory management
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps":
+            # MPS doesn't have empty_cache yet
+            pass
 
         return generated_text.strip()
 
