@@ -1,0 +1,24 @@
+[global]
+developmentMode = false
+
+[server]
+fileWatcherType = "none"
+address = "0.0.0.0"
+port = 10011
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
+serverAddress = "0.0.0.0"
+serverPort = 10011
+
+[logger]
+level = "error"
+
+[client]
+showErrorDetails = false
+
+[theme]
+base = "light" 

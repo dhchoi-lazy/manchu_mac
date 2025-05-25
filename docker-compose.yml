@@ -1,0 +1,21 @@
+services:
+  manchu-streamlit:
+    build: .
+    container_name: manchu-streamlit-app
+    network_mode: host
+    environment:
+      - STREAMLIT_SERVER_PORT=10011
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_FILE_WATCHER_TYPE=none
+      - TOKENIZERS_PARALLELISM=false
+    volumes:
+      # Cache directories for faster model loading
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10011/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

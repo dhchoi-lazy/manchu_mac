@@ -1,0 +1,16 @@
+[global]
+developmentMode = false
+
+[server]
+fileWatcherType = "none"
+address = "localhost"
+port = 10011
+
+[browser]
+gatherUsageStats = false
+
+[logger]
+level = "info"
+
+[client]
+showErrorDetails = false 
