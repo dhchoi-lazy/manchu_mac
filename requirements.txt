@@ -55,15 +55,6 @@ typing-extensions==4.13.2
 tzdata==2025.2
 urllib3==2.4.0
 
-# MLX packages (compatible versions)
-mlx
-mlx-lm
-mlx-vlm
-
 # Additional packages
 datasets
-gradio
 pydantic
-
-# Note: outlinesmlx removed due to dependency conflicts with mlx-vlm
-# Use the post-processing approach in test_mlx.py for structured output

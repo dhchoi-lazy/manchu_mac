@@ -1,1 +1,0 @@
-nohup python3 run_streamlit.py > streamlit.out 2>&1 &
